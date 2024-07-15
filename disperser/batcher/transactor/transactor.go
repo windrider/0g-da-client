@@ -65,12 +65,14 @@ func (t *Transactor) SubmitVerifiedCommitRoots(daContract *contract.DAContract, 
 		return eth_common.Hash{}, errors.WithMessage(err, "Failed to estimate SubmitVerifiedCommitRoots")
 	}
 
+	var receipt *types.Receipt
 	t.logger.Info("[transactor] estimate gas", "gas limit", txHash.Gas())
-	if txHash, _, err = daContract.SubmitVerifiedCommitRoots(submissions, txHash.Gas(), false, false); err != nil {
+	if txHash, receipt, err = daContract.SubmitVerifiedCommitRoots(submissions, txHash.Gas(), true, false); err != nil {
+		t.logger.Warn("[transactor] submit verified commit roots fail", "receipt", receipt)
 		return eth_common.Hash{}, errors.WithMessage(err, "Failed to submit verified commit roots")
 	}
 
-	t.logger.Debug("[transactor] submit verified commit roots took", "duration", time.Since(stageTimer))
+	t.logger.Info("[transactor] submit verified commit roots took", "duration", time.Since(stageTimer), "receipt", receipt)
 
 	return txHash.Hash(), nil
 }

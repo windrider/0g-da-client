@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"math/big"
 
+	"encoding/hex"
+
 	"github.com/0glabs/0g-da-client/common"
 	"github.com/0glabs/0g-da-client/core"
 	"github.com/0glabs/0g-da-client/disperser"
@@ -115,6 +117,7 @@ func (c *dispatcher) SubmitAggregateSignatures(ctx context.Context, rootSubmissi
 	submissions := make([]da_entrance.IDAEntranceCommitRootSubmission, len(rootSubmission))
 	c.logger.Debug("[dispatcher] submit aggregate signatures", "size", len(rootSubmission))
 	for i, s := range rootSubmission {
+		c.logger.Info("Submit Aggregate Signatures", "root", hex.EncodeToString(s.DataRoot[:]), "epoch", s.Epoch.String(), "quorum", s.QuorumId.String(), "X", s.ErasureCommitment.X.BigInt(new(big.Int)).String(), "Y", s.ErasureCommitment.Y.BigInt(new(big.Int)).String())
 		submissions[i] = da_entrance.IDAEntranceCommitRootSubmission{
 			DataRoot: s.DataRoot,
 			Epoch:    s.Epoch,
