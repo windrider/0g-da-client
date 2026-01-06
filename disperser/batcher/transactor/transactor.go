@@ -30,24 +30,37 @@ func (t *Transactor) SubmitLogEntry(daContract *contract.DAContract, dataRoots [
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	t.logger.Info("[transactor] SubmitLogEntry called", "dataRoots count", len(dataRoots))
+	for i, root := range dataRoots {
+		if i < 3 { // 只打印前3个
+			t.logger.Info("[transactor] dataRoot", "index", i, "root", root.Hex())
+		}
+	}
+
 	// Append log on blockchain
 	var txHash eth_common.Hash
 	var err error
 	if txHash, _, err = daContract.SubmitOriginalData(dataRoots, false); err != nil {
+		t.logger.Error("[transactor] SubmitOriginalData failed", "error", err, "dataRoots count", len(dataRoots))
 		return eth_common.Hash{}, errors.WithMessage(err, "Failed to submit log entry")
 	}
+
+	t.logger.Info("[transactor] SubmitOriginalData returned", "txHash", txHash.Hex())
 	return txHash, nil
 }
 
 func (t *Transactor) BatchUpload(daContract *contract.DAContract, dataRoots []eth_common.Hash) (eth_common.Hash, error) {
 	stageTimer := time.Now()
 
+	t.logger.Info("[transactor] BatchUpload starting", "dataRoots count", len(dataRoots))
+
 	txHash, err := t.SubmitLogEntry(daContract, dataRoots)
 	if err != nil {
+		t.logger.Error("[transactor] BatchUpload failed", "error", err, "duration", time.Since(stageTimer))
 		return eth_common.Hash{}, err
 	}
 
-	t.logger.Info("[transactor] batch upload took", "duration", time.Since(stageTimer))
+	t.logger.Info("[transactor] batch upload took", "duration", time.Since(stageTimer), "txHash", txHash.Hex())
 
 	return txHash, nil
 }

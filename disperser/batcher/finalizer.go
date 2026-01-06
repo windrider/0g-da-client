@@ -116,6 +116,24 @@ func (f *finalizer) updateFinalizedBlockNumber(ctx context.Context) {
 		}
 	} else {
 		blockNumber = uint64(header.Number.Uint64())
+		// Conflux dev mode compatibility: finalized returns block 0 when PoS is disabled
+		// Use latest - defaultFinalizedBlockCount instead
+		if blockNumber == 0 {
+			f.logger.Warn("[finalizer] Finalized block is 0, likely Conflux dev mode without PoS. Using latest - defaultFinalizedBlockCount")
+			ctxWithTimeout, cancel := context.WithTimeout(ctx, f.timeout)
+			defer cancel()
+			err := f.rpcClient.CallContext(ctxWithTimeout, &header, "eth_getBlockByNumber", "latest", false)
+			if err != nil {
+				f.logger.Error("[finalizer] error getting latest block for fallback", "err", err)
+				return
+			}
+			latestBlock := header.Number.Uint64()
+			if latestBlock > f.defaultFinalizedBlockCount {
+				blockNumber = latestBlock - f.defaultFinalizedBlockCount
+			} else {
+				blockNumber = 0
+			}
+		}
 	}
 
 	f.mu.Lock()

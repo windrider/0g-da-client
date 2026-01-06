@@ -342,6 +342,7 @@ func (s *SliceSigner) waitForReceipt(txHash eth_common.Hash) ([]*contract.DataUp
 }
 
 func (s *SliceSigner) getSigners(epoch *big.Int, quorumId *big.Int) (map[eth_common.Address]*SignerState, error) {
+	// Get quorum signers from chain (quorum length is always 1024)
 	signerAddresses, err := s.daContract.GetQuorum(nil, epoch, quorumId)
 	s.logger.Debug("[signer] get signers for quorum", "size", len(signerAddresses))
 
