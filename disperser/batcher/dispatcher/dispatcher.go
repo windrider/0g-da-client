@@ -9,6 +9,7 @@ import (
 
 	"github.com/0glabs/0g-da-client/common"
 	"github.com/0glabs/0g-da-client/core"
+	bn254utils "github.com/0glabs/0g-da-client/core/bn254"
 	"github.com/0glabs/0g-da-client/disperser"
 	"github.com/0glabs/0g-da-client/disperser/batcher/transactor"
 	"github.com/0glabs/0g-da-client/disperser/contract"
@@ -117,14 +118,22 @@ func (c *dispatcher) SubmitAggregateSignatures(ctx context.Context, rootSubmissi
 	submissions := make([]da_entrance.IDAEntranceCommitRootSubmission, len(rootSubmission))
 	c.logger.Debug("[dispatcher] submit aggregate signatures", "size", len(rootSubmission))
 	for i, s := range rootSubmission {
-		c.logger.Info("Submit Aggregate Signatures", "root", hex.EncodeToString(s.DataRoot[:]), "epoch", s.Epoch.String(), "quorum", s.QuorumId.String(), "X", s.ErasureCommitment.X.BigInt(new(big.Int)).String(), "Y", s.ErasureCommitment.Y.BigInt(new(big.Int)).String())
+		commitX, commitY, err := s.ErasureCommitment.ContractBN254Coords()
+		if err != nil {
+			return eth_common.Hash{}, fmt.Errorf("failed to encode erasure commitment: %w", err)
+		}
+		sigX, sigY, err := s.AggSigs.ContractBN254Coords()
+		if err != nil {
+			return eth_common.Hash{}, fmt.Errorf("failed to encode signature: %w", err)
+		}
+		c.logger.Info("Submit Aggregate Signatures", "root", hex.EncodeToString(s.DataRoot[:]), "epoch", s.Epoch.String(), "quorum", s.QuorumId.String(), "X", commitX.String(), "Y", commitY.String())
 		submissions[i] = da_entrance.IDAEntranceCommitRootSubmission{
 			DataRoot: s.DataRoot,
 			Epoch:    s.Epoch,
 			QuorumId: s.QuorumId,
 			ErasureCommitment: da_entrance.BN254G1Point{
-				X: s.ErasureCommitment.X.BigInt(new(big.Int)),
-				Y: s.ErasureCommitment.Y.BigInt(new(big.Int)),
+				X: commitX,
+				Y: commitY,
 			},
 			QuorumBitmap: s.QuorumBitmap,
 			AggPkG2: da_entrance.BN254G2Point{
@@ -138,10 +147,30 @@ func (c *dispatcher) SubmitAggregateSignatures(ctx context.Context, rootSubmissi
 				},
 			},
 			Signature: da_entrance.BN254G1Point{
-				X: s.AggSigs.X.BigInt(new(big.Int)),
-				Y: s.AggSigs.Y.BigInt(new(big.Int)),
+				X: sigX,
+				Y: sigY,
 			},
 		}
+
+		aggPkG1, err := c.daContract.GetAggPkG1(nil, s.Epoch, s.QuorumId, s.QuorumBitmap)
+		if err != nil {
+			return eth_common.Hash{}, fmt.Errorf("failed to get agg pkG1: %w", err)
+		}
+		hashPoint := bn254utils.SubmissionDataHash(s.DataRoot, s.Epoch, s.QuorumId, commitX, commitY)
+		valid, err := bn254utils.ValidateSubmissionSignature(
+			sigX, sigY,
+			aggPkG1.AggPkG1.X, aggPkG1.AggPkG1.Y,
+			submissions[i].AggPkG2.X[0], submissions[i].AggPkG2.X[1],
+			submissions[i].AggPkG2.Y[0], submissions[i].AggPkG2.Y[1],
+			hashPoint,
+		)
+		if err != nil {
+			return eth_common.Hash{}, fmt.Errorf("submission signature validation error: %w", err)
+		}
+		if !valid {
+			return eth_common.Hash{}, fmt.Errorf("submission signature invalid (local gamma pairing check failed)")
+		}
+		c.logger.Info("Submit Aggregate Signatures validated", "root", hex.EncodeToString(s.DataRoot[:]), "hit", aggPkG1.Hit.String(), "total", aggPkG1.Total.String())
 	}
 
 	txHash, err := c.transactor.SubmitVerifiedCommitRoots(c.daContract, submissions)

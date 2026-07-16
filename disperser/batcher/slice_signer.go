@@ -15,14 +15,15 @@ import (
 	"github.com/0glabs/0g-da-client/disperser"
 	pb "github.com/0glabs/0g-da-client/disperser/api/grpc/signer"
 	"github.com/0glabs/0g-da-client/disperser/contract"
+	"github.com/0glabs/0g-da-client/disperser/contract/da_signers"
 	"github.com/consensys/gnark-crypto/ecc/bn254"
 	"github.com/consensys/gnark-crypto/ecc/bn254/fp"
-	"github.com/ethereum/go-ethereum/accounts/abi"
 	eth_common "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
-	"github.com/hashicorp/go-multierror"
+	ethmath "github.com/ethereum/go-ethereum/common/math"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/wealdtech/go-merkletree"
-	"golang.org/x/crypto/sha3"
+	"github.com/hashicorp/go-multierror"
 )
 
 var errNoSignedResults = errors.New("no signed results")
@@ -375,18 +376,13 @@ func (s *SliceSigner) getSigners(epoch *big.Int, quorumId *big.Int) (map[eth_com
 
 	for _, signer := range signers {
 		pubkeyG1 := core.NewG1Point(signer.PkG1.X, signer.PkG1.Y)
-
-		pubkeyG2 := new(bn254.G2Affine)
-		pubkeyG2.X.A0.SetBigInt(signer.PkG2.X[0])
-		pubkeyG2.X.A1.SetBigInt(signer.PkG2.X[1])
-		pubkeyG2.Y.A0.SetBigInt(signer.PkG2.Y[0])
-		pubkeyG2.Y.A1.SetBigInt(signer.PkG2.Y[1])
+		pubkeyG2 := contractG2PointToGnark(signer.PkG2)
 
 		hm[signer.Signer].SignerInfo = &SignerInfo{
 			Signer: signer.Signer,
 			Socket: signer.Socket,
 			PkG1:   pubkeyG1,
-			PkG2:   &core.G2Point{G2Affine: pubkeyG2},
+			PkG2:   pubkeyG2,
 		}
 	}
 
@@ -486,13 +482,10 @@ func (s *SliceSigner) assignEncodedBlobs(signers map[eth_common.Address]*SignerS
 			}
 
 			if requestData[addr][blobIdx] == nil {
-				commitment := encodedBlobs.ErasureCommitment.Serialize()
-
-				for i := 0; i < fp.Bytes/2; i++ {
-					commitment[i], commitment[fp.Bytes-i-1] = commitment[fp.Bytes-i-1], commitment[i]
-				}
-				for i := fp.Bytes; i < fp.Bytes+fp.Bytes/2; i++ {
-					commitment[i], commitment[len(commitment)-(i-fp.Bytes)-1] = commitment[len(commitment)-(i-fp.Bytes)-1], commitment[i]
+				commitment, err := wireFormatErasureCommitment(encodedBlobs.ErasureCommitment)
+				if err != nil {
+					s.logger.Error("[signer] failed to encode erasure commitment", "err", err)
+					continue
 				}
 
 				requestData[addr][blobIdx] = &pb.SignRequest{
@@ -526,7 +519,12 @@ func (s *SliceSigner) aggregateSignature(ctx context.Context, signInfo *SignInfo
 
 		erasureCommitments[blobIdx] = encodedBlobs.ErasureCommitment
 		storageRoots[blobIdx] = dataRoot
-		msg, err := getHash(dataRoot, signInfo.epoch, signInfo.quorumId, encodedBlobs.ErasureCommitment)
+		wireCommitment, err := wireFormatErasureCommitment(encodedBlobs.ErasureCommitment)
+		if err != nil {
+			s.logger.Error("[signer] failed to encode wire erasure commitment", "batch", signInfo.ts, "error", err)
+			return err
+		}
+		msg, err := getHashFromWire(dataRoot, signInfo.epoch, signInfo.quorumId, wireCommitment)
 		if err != nil {
 			s.logger.Error("[signer] failed to get hash for batch", "batch", signInfo.ts, "error", err)
 			if signInfo.reties < s.MaxNumRetriesSign {
@@ -565,6 +563,10 @@ func (s *SliceSigner) aggregateSignature(ctx context.Context, signInfo *SignInfo
 		s.logger.Debug("[signer] received signature from signer", "address", signer.Signer, "socket", signer.Socket, "signature size", len(signatures))
 		for blobIdx, sig := range signatures {
 			message := messages[blobIdx]
+			weight := len(signer.sliceIndexes)
+			if weight == 0 {
+				continue
+			}
 
 			// Verify Signature
 			ok := sig.Verify(signer.PkG2, message)
@@ -573,21 +575,24 @@ func (s *SliceSigner) aggregateSignature(ctx context.Context, signInfo *SignInfo
 				continue
 			}
 
+			weightedSig := scaleG1Point(sig.G1Point, weight)
+			weightedPkG2 := scaleG2Point(signer.PkG2, weight)
+
 			if aggSigs[blobIdx] == nil {
-				aggSigs[blobIdx] = &core.Signature{G1Point: sig.Clone()}
-				aggPubKeys[blobIdx] = signer.PkG2.Clone()
+				aggSigs[blobIdx] = &core.Signature{G1Point: weightedSig}
+				aggPubKeys[blobIdx] = weightedPkG2
 
 				signatureCounts[blobIdx] = 0
 
 				sliceSize := len(signInfo.batch.EncodedBlobs[blobIdx].EncodedSlice)
 				bitmapLen := sliceSize / 8
 				if sliceSize%8 != 0 {
-					sliceSize++
+					bitmapLen++
 				}
 				quorumBitmap[blobIdx] = make([]byte, bitmapLen)
 			} else {
-				aggSigs[blobIdx].Add(sig.G1Point)
-				aggPubKeys[blobIdx].Add(signer.PkG2)
+				aggSigs[blobIdx].Add(weightedSig)
+				aggPubKeys[blobIdx].Add(weightedPkG2)
 			}
 
 			signatureCounts[blobIdx]++
@@ -747,62 +752,57 @@ func (s *SliceSigner) RemoveBatchingStatus(ts uint64) {
 	delete(s.signedBatches, ts)
 }
 
+func wireFormatErasureCommitment(p *core.G1Point) ([]byte, error) {
+	return core.WireFormatErasureCommitment(p)
+}
+
+func contractG2PointToGnark(p da_signers.BN254G2Point) *core.G2Point {
+	pubkeyG2 := new(bn254.G2Affine)
+	// BN254.sol encodes Fp2 as X[1] + X[0]*i; gnark uses A0 + A1*u (A0 real, A1 imag).
+	pubkeyG2.X.A0.SetBigInt(p.X[1])
+	pubkeyG2.X.A1.SetBigInt(p.X[0])
+	pubkeyG2.Y.A0.SetBigInt(p.Y[1])
+	pubkeyG2.Y.A1.SetBigInt(p.Y[0])
+	return &core.G2Point{G2Affine: pubkeyG2}
+}
+
+func contractU256BytesFromWireCoord(wireCoord []byte) []byte {
+	return ethmath.U256Bytes(core.U256FromLittleEndianBytes(wireCoord))
+}
+
+func getHashFromWire(dataRoot [32]byte, epoch, quorumId *big.Int, wireCommitment []byte) ([32]byte, error) {
+	if len(wireCommitment) != fp.Bytes*2 {
+		return [32]byte{}, fmt.Errorf("invalid wire erasure commitment length: %d", len(wireCommitment))
+	}
+	var packed []byte
+	packed = append(packed, dataRoot[:]...)
+	packed = append(packed, ethmath.U256Bytes(epoch)...)
+	packed = append(packed, ethmath.U256Bytes(quorumId)...)
+	packed = append(packed, contractU256BytesFromWireCoord(wireCommitment[:fp.Bytes])...)
+	packed = append(packed, contractU256BytesFromWireCoord(wireCommitment[fp.Bytes:])...)
+	return crypto.Keccak256Hash(packed), nil
+}
+
 func getHash(dataRoot [32]byte, epoch, quorumId *big.Int, erasureCommitment *core.G1Point) ([32]byte, error) {
-	dataType, err := abi.NewType("tuple", "", []abi.ArgumentMarshaling{
-		{
-			Name: "dataRoot",
-			Type: "bytes32",
-		},
-		{
-			Name: "epoch",
-			Type: "uint256",
-		},
-		{
-			Name: "quorumId",
-			Type: "uint256",
-		},
-		{
-			Name: "X",
-			Type: "uint256",
-		},
-		{
-			Name: "Y",
-			Type: "uint256",
-		},
-	})
+	wireCommitment, err := wireFormatErasureCommitment(erasureCommitment)
 	if err != nil {
 		return [32]byte{}, err
 	}
+	return getHashFromWire(dataRoot, epoch, quorumId, wireCommitment)
+}
 
-	arguments := abi.Arguments{
-		{
-			Type: dataType,
-		},
+func scaleG1Point(p *core.G1Point, weight int) *core.G1Point {
+	if weight <= 1 {
+		return p.Clone()
 	}
+	scaled := new(bn254.G1Affine).ScalarMultiplication(p.G1Affine, big.NewInt(int64(weight)))
+	return &core.G1Point{G1Affine: scaled}
+}
 
-	o := struct {
-		DataRoot [32]byte
-		Epoch    *big.Int
-		QuorumId *big.Int
-		X        *big.Int
-		Y        *big.Int
-	}{
-		DataRoot: dataRoot,
-		Epoch:    epoch,
-		QuorumId: quorumId,
-		X:        erasureCommitment.X.BigInt(new(big.Int)),
-		Y:        erasureCommitment.Y.BigInt(new(big.Int)),
+func scaleG2Point(p *core.G2Point, weight int) *core.G2Point {
+	if weight <= 1 {
+		return p.Clone()
 	}
-
-	bytes, err := arguments.Pack(o)
-	if err != nil {
-		return [32]byte{}, err
-	}
-
-	var headerHash [32]byte
-	hasher := sha3.NewLegacyKeccak256()
-	hasher.Write(bytes)
-	copy(headerHash[:], hasher.Sum(nil)[:32])
-
-	return headerHash, nil
+	scaled := new(bn254.G2Affine).ScalarMultiplication(p.G2Affine, big.NewInt(int64(weight)))
+	return &core.G2Point{G2Affine: scaled}
 }

@@ -116,22 +116,24 @@ func (f *finalizer) updateFinalizedBlockNumber(ctx context.Context) {
 		}
 	} else {
 		blockNumber = uint64(header.Number.Uint64())
-		// Conflux dev mode compatibility: finalized returns block 0 when PoS is disabled
-		// Use latest - defaultFinalizedBlockCount instead
-		if blockNumber == 0 {
-			f.logger.Warn("[finalizer] Finalized block is 0, likely Conflux dev mode without PoS. Using latest - defaultFinalizedBlockCount")
-			ctxWithTimeout, cancel := context.WithTimeout(ctx, f.timeout)
-			defer cancel()
-			err := f.rpcClient.CallContext(ctxWithTimeout, &header, "eth_getBlockByNumber", "latest", false)
-			if err != nil {
-				f.logger.Error("[finalizer] error getting latest block for fallback", "err", err)
-				return
-			}
-			latestBlock := header.Number.Uint64()
-			if latestBlock > f.defaultFinalizedBlockCount {
-				blockNumber = latestBlock - f.defaultFinalizedBlockCount
-			} else {
-				blockNumber = 0
+		// Conflux dev mode: finalized tag may be 0 or stuck at an old height without PoS.
+		// Fall back to latest - defaultFinalizedBlockCount when finalized lags behind latest.
+		ctxWithTimeout, cancel := context.WithTimeout(ctx, f.timeout)
+		var latestHeader types.Header
+		err := f.rpcClient.CallContext(ctxWithTimeout, &latestHeader, "eth_getBlockByNumber", "latest", false)
+		cancel()
+		if err != nil {
+			f.logger.Error("[finalizer] error getting latest block for finalized fallback", "err", err)
+		} else {
+			latestBlock := latestHeader.Number.Uint64()
+			if latestBlock > blockNumber+f.defaultFinalizedBlockCount {
+				f.logger.Warn("[finalizer] Finalized block is stale, using latest - defaultFinalizedBlockCount",
+					"finalized", blockNumber, "latest", latestBlock)
+				if latestBlock > f.defaultFinalizedBlockCount {
+					blockNumber = latestBlock - f.defaultFinalizedBlockCount
+				} else {
+					blockNumber = 0
+				}
 			}
 		}
 	}

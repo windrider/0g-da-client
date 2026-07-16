@@ -96,6 +96,35 @@ func (p *G1Point) Hash() [32]byte {
 	return crypto.Keccak256Hash(p.Serialize())
 }
 
+func WireFormatErasureCommitment(p *G1Point) ([]byte, error) {
+	commitment := make([]byte, len(p.Serialize()))
+	copy(commitment, p.Serialize())
+	for i := 0; i < fp.Bytes/2; i++ {
+		commitment[i], commitment[fp.Bytes-i-1] = commitment[fp.Bytes-i-1], commitment[i]
+	}
+	for i := fp.Bytes; i < fp.Bytes+fp.Bytes/2; i++ {
+		commitment[i], commitment[len(commitment)-(i-fp.Bytes)-1] = commitment[len(commitment)-(i-fp.Bytes)-1], commitment[i]
+	}
+	return commitment, nil
+}
+
+func U256FromLittleEndianBytes(b []byte) *big.Int {
+	out := new(big.Int)
+	for i := 0; i < len(b); i++ {
+		out.Or(out, new(big.Int).Lsh(big.NewInt(int64(b[i])), uint(i*8)))
+	}
+	return out
+}
+
+// ContractBN254Coords returns G1 coordinates in BN254.sol / da-node serialize_g1_point form.
+func (p *G1Point) ContractBN254Coords() (x, y *big.Int, err error) {
+	wire, err := WireFormatErasureCommitment(p)
+	if err != nil {
+		return nil, nil, err
+	}
+	return U256FromLittleEndianBytes(wire[:fp.Bytes]), U256FromLittleEndianBytes(wire[fp.Bytes:]), nil
+}
+
 type G2Point struct {
 	*bn254.G2Affine
 }
